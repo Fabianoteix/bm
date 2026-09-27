@@ -1,0 +1,160 @@
+name: bamaq-transactions
+
+x-app: &app
+  build: .
+  image: bamaq-transactions:local
+  restart: unless-stopped
+  environment: &app-env
+    APP_ENVIRONMENT: docker
+    APP_LOG_LEVEL: INFO
+    APP_DATABASE_URL: mysql+pymysql://app:app@mysql:3306/transactions
+    APP_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    APP_RISK_SERVICE_URL: http://risk-mock:8081
+  depends_on: &app-deps
+    migrate:
+      condition: service_completed_successfully
+    kafka-init:
+      condition: service_completed_successfully
+
+services:
+  # ------------------------------------------------------------------ infra
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: transactions
+      MYSQL_USER: app
+      MYSQL_PASSWORD: app
+      MYSQL_ROOT_PASSWORD: root
+    command: ["--transaction-isolation=READ-COMMITTED", "--character-set-server=utf8mb4"]
+    ports: ["3306:3306"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uapp", "-papp"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes: [mysql-data:/var/lib/mysql]
+
+  kafka:
+    image: apache/kafka:3.9.0
+    ports: ["29092:29092"]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+
+  kafka-init:
+    image: apache/kafka:3.9.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        T=/opt/kafka/bin/kafka-topics.sh
+        B=kafka:9092
+        # Em produção: replication-factor=3 e min.insync.replicas=2 (acks=all).
+        # 48 partições desde o dia 1 (Cenário 5: 10 mil eventos/min precisam de ~34).
+        # NUNCA aumentar partições de um tópico em uso: muda hash(chave) mod N e a
+        # ordem por transaction_id quebra na transição. Precisou de mais? Crie um
+        # tópico novo (.v2) e migre os produtores. Partição ociosa é barata no KRaft;
+        # para escalar, suba mais workers (até 48 consomem em paralelo).
+        $$T --bootstrap-server $$B --create --if-not-exists --topic transactions.processing.v1     --partitions 48 --replication-factor 1
+        $$T --bootstrap-server $$B --create --if-not-exists --topic transactions.events.v1         --partitions 48 --replication-factor 1
+        $$T --bootstrap-server $$B --create --if-not-exists --topic transactions.processing.dlq.v1 --partitions 3  --replication-factor 1 --config retention.ms=1209600000
+        $$T --bootstrap-server $$B --list
+    restart: "no"
+
+  # ------------------------------------------------------------ aplicação
+  migrate:
+    image: bamaq-transactions:local
+    build: .
+    environment:
+      APP_DATABASE_URL: mysql+pymysql://app:app@mysql:3306/transactions
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *app
+    command: ["transactions-api"]
+    ports: ["8000:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')"]
+      interval: 10s
+      retries: 5
+
+  relay:
+    <<: *app
+    command: ["transactions-relay"]
+    deploy:
+      replicas: 2 # SKIP LOCKED permite várias instâncias sem duplicar publicação
+
+  worker:
+    <<: *app
+    command: ["transactions-worker"]
+    depends_on:
+      <<: *app-deps
+      risk-mock:
+        condition: service_started
+    deploy:
+      replicas: 3 # escala até o nº de partições (48) sem mexer no tópico
+
+  risk-mock:
+    image: bamaq-transactions:local
+    build: .
+    command: ["uvicorn", "mock_risk_service.app:app", "--host", "0.0.0.0", "--port", "8081"]
+    ports: ["8081:8081"]
+    environment:
+      FAILURE_RATE: "0.1"
+      SLOW_RATE: "0.05"
+      SLOW_SECONDS: "5"
+
+  # --------------------------------------------- observabilidade (opcional)
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    profiles: ["observability"]
+    volumes:
+      - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./ops/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    profiles: ["observability"]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    profiles: ["observability"]
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    ports: ["8080:8080"]
+    depends_on: [kafka]
+
+volumes:
+  mysql-data:

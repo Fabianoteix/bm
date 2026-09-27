@@ -1,0 +1,57 @@
+# Regras de alerta do Prometheus (carregadas por ops/prometheus.yml).
+# Validação: promtool check rules ops/alerts.yml && promtool test rules ops/alerts_test.yml
+#
+# O circuit breaker é local a cada worker. Uma falha parcial (alguns workers com
+# o circuito aberto) quase não mexe na taxa de erro agregada, então os alertas
+# olham o estado de CADA processo (label `instance`, dado pelo scrape).
+
+groups:
+  - name: risk-circuit-breaker
+    rules:
+      - alert: RiskCircuitOpenOnWorker
+        expr: risk_service_circuit_state{job="worker"} == 2
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Circuit breaker do risco aberto em {{ $labels.instance }}"
+          description: >-
+            O worker {{ $labels.instance }} está com o circuito aberto há 3 min e
+            suas partições estão pausadas (backpressure). Verificar latência e
+            erros do serviço de risco vistos por esse worker.
+
+      - alert: RiskCircuitOpenFleetWide
+        expr: |
+          count(risk_service_circuit_state{job="worker"} == 2)
+            / count(risk_service_circuit_state{job="worker"}) >= 0.5
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Circuit breaker do risco aberto em {{ $value | humanizePercentage }} dos workers"
+          description: >-
+            Metade ou mais da frota parou de consumir. As transações ficam
+            PENDING/RETRYING até o serviço de risco voltar.
+
+      - alert: RiskCircuitFlapping
+        expr: increase(risk_service_circuit_transitions_total{job="worker",to_state="open"}[15m]) > 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "Circuit breaker do risco oscilando em {{ $labels.instance }}"
+          description: >-
+            Mais de 3 aberturas em 15 min: o serviço de risco está instável ou o
+            limiar/reset do breaker está mal ajustado.
+
+  - name: outbox
+    rules:
+      - alert: OutboxLagHigh
+        expr: max(outbox_oldest_pending_age_seconds{job="relay"}) > 60
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Evento mais antigo do outbox espera há {{ $value | humanizeDuration }}"
+          description: >-
+            O relay não está publicando (Kafka fora, relay parado ou lento).
+            Nada se perde, mas o processamento está atrasado.
